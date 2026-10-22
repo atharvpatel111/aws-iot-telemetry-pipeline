@@ -1,0 +1,7 @@
+{
+  "device_id": "!!bad_id!!",
+  "timestamp": "not-a-timestamp",
+  "temperature": 199.99,
+  "humidity": -15.5,
+  "battery_voltage": 0.5
+}

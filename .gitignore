@@ -1,0 +1,35 @@
+# Virtual Environment
+.venv/
+venv/
+ENV/
+env/
+
+# Python Cache & Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Credentials, Keys, and Certificates (CRITICAL - DO NOT COMMIT)
+*.pem
+*.crt
+*.key
+*.csr
+*.pfx
+certs/
+.env
+.env.*
+!.env.example
+aws-credentials*
+
+# AWS SAM build outputs
+.aws-sam/
+
+# IDE & OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

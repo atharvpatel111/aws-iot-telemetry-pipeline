@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Serverless IoT Telemetry Dashboard</title>
+  <meta name="description" content="Real-time telemetry monitoring for ESP32 IoT sensors powered by AWS Serverless.">
+  <link rel="stylesheet" href="styles.css">
+  <!-- Chart.js for responsive time-series telemetry charts -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+  <!-- Header -->
+  <header class="header">
+    <div class="brand">
+      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color: var(--accent-color);">
+        <path d="M5 12.55a11 11 0 0 1 14.08 0"></path>
+        <path d="M1.42 9a16 16 0 0 1 21.16 0"></path>
+        <path d="M8.53 16.11a6 6 0 0 1 6.95 0"></path>
+        <line x1="12" y1="20" x2="12.01" y2="20"></line>
+      </svg>
+      <h1>IoT Telemetry Monitor</h1>
+      <div id="health-indicator" class="health-badge" aria-live="polite">
+        <span class="health-dot"></span>
+        <span id="health-text">Checking System...</span>
+      </div>
+    </div>
+
+    <div class="controls">
+      <label for="device-select" class="sr-only" style="position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); border: 0;">Select Device</label>
+      <select id="device-select" aria-label="Select IoT Device">
+        <!-- Dynamically populated from config.js or API -->
+      </select>
+
+      <button id="refresh-btn" title="Refresh Telemetry Now" aria-label="Refresh Data">
+        ↻ Refresh
+      </button>
+
+      <button id="auto-refresh-btn" class="active" title="Toggle Auto-Refresh" aria-label="Toggle Auto-Refresh">
+        ● Auto (5s)
+      </button>
+
+      <button id="theme-toggle" title="Toggle Light/Dark Theme" aria-label="Toggle Theme">
+        🌙
+      </button>
+    </div>
+  </header>
+
+  <!-- Main Dashboard Content -->
+  <main class="container">
+    <!-- Error Alert Banner -->
+    <div id="error-banner" class="alert-banner" role="alert">
+      <span id="error-message">Unable to connect to the telemetry API.</span>
+      <button id="dismiss-error" aria-label="Dismiss error">×</button>
+    </div>
+
+    <!-- Live Telemetry Metric Cards -->
+    <section class="cards-grid" aria-label="Current Sensor Metrics">
+      <!-- Temperature Card -->
+      <article class="card" id="card-temperature">
+        <div class="card-header">
+          <span>Temperature</span>
+          <span>🌡️</span>
+        </div>
+        <div class="card-value">
+          <span id="val-temperature">--.-</span>
+          <span class="card-unit">°C</span>
+        </div>
+        <div class="card-footer">
+          <span>Target: 18 - 28°C</span>
+          <span id="temp-trend">Normal</span>
+        </div>
+      </article>
+
+      <!-- Humidity Card -->
+      <article class="card" id="card-humidity">
+        <div class="card-header">
+          <span>Relative Humidity</span>
+          <span>💧</span>
+        </div>
+        <div class="card-value">
+          <span id="val-humidity">--.-</span>
+          <span class="card-unit">%</span>
+        </div>
+        <div class="card-footer">
+          <span>Target: 30 - 70%</span>
+          <span id="humidity-trend">Optimal</span>
+        </div>
+      </article>
+
+      <!-- Battery Voltage Card -->
+      <article class="card" id="card-battery">
+        <div class="card-header">
+          <span>Battery Voltage</span>
+          <span>🔋</span>
+        </div>
+        <div class="card-value">
+          <span id="val-battery">-.--</span>
+          <span class="card-unit">V</span>
+        </div>
+        <div class="progress-bar-bg" title="Battery Level">
+          <div id="battery-bar" class="progress-bar-fill" style="width: 0%;"></div>
+        </div>
+        <div class="card-footer">
+          <span id="battery-pct">--%</span>
+          <span>LiPo (3.0 - 4.2V)</span>
+        </div>
+      </article>
+
+      <!-- Device Status Card -->
+      <article class="card" id="card-status">
+        <div class="card-header">
+          <span>Device Status</span>
+          <span>⚡</span>
+        </div>
+        <div class="card-value" style="font-size: 1.5rem; margin-top: 0.35rem;">
+          <span id="val-status" class="badge badge-ok">UNKNOWN</span>
+        </div>
+        <div class="card-footer" style="margin-top: 0.75rem;">
+          <span>Last seen: <span id="val-last-seen">Never</span></span>
+          <span id="val-firmware">v1.0.0</span>
+        </div>
+      </article>
+    </section>
+
+    <!-- Historical Chart Section -->
+    <section class="chart-section" aria-label="Historical Telemetry Charts">
+      <div class="chart-header">
+        <h2 class="chart-title">Telemetry Time-Series History</h2>
+        <div class="chart-controls" role="group" aria-label="Time range selector">
+          <button class="range-btn active" data-range="1h">1h</button>
+          <button class="range-btn" data-range="6h">6h</button>
+          <button class="range-btn" data-range="24h">24h</button>
+          <button class="range-btn" data-range="7d">7d</button>
+        </div>
+      </div>
+
+      <div class="chart-container">
+        <div id="chart-loading" class="loading-overlay">
+          <div class="spinner" aria-label="Loading chart data"></div>
+        </div>
+        <div id="chart-empty" class="empty-state">
+          <p>No historical telemetry available for this device and time window.</p>
+        </div>
+        <canvas id="telemetryChart"></canvas>
+      </div>
+    </section>
+  </main>
+
+  <!-- Footer -->
+  <footer class="footer">
+    <p>Serverless IoT Telemetry Pipeline • Built with AWS IoT Core, Lambda, DynamoDB & API Gateway</p>
+  </footer>
+
+  <!-- Scripts -->
+  <script src="config.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,10 @@
+{
+  "device_id": "esp32-sensor-01",
+  "timestamp": "2026-10-22T21:35:00.000Z",
+  "temperature": 58.75,
+  "humidity": 22.10,
+  "battery_voltage": 3.85,
+  "status": "WARNING",
+  "message_id": "b2c3d4e5-f6a7-8b9c-0d1e-2f3a4b5c6d7e",
+  "firmware_version": "1.0.0"
+}

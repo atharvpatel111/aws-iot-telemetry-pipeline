@@ -1,0 +1,439 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Serverless IoT Telemetry Pipeline
+  Ingests sensor telemetry via AWS IoT Core, validates with AWS Lambda,
+  persists to Amazon DynamoDB with single-table design, exposes query
+  endpoints via Amazon API Gateway, and monitors system health via
+  Amazon CloudWatch alarms and metrics.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Deployment environment stage
+
+  LogLevel:
+    Type: String
+    Default: INFO
+    AllowedValues:
+      - DEBUG
+      - INFO
+      - WARNING
+      - ERROR
+    Description: Logging level for Lambda functions
+
+  LogRetentionInDays:
+    Type: Number
+    Default: 14
+    AllowedValues: [7, 14, 30, 60, 90]
+    Description: Retention period in days for CloudWatch log groups to prevent unbounded costs
+
+  AlertEmail:
+    Type: String
+    Default: ""
+    Description: Optional email address to receive SNS alarm notifications (requires clicking confirmation email)
+
+Conditions:
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
+
+Resources:
+  # ============================================================================
+  # 1. DynamoDB Telemetry Table (Single-Table Design with TTL)
+  # ============================================================================
+  TelemetryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "iot-telemetry-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: device_id
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: device_id
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: false
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: IoT-Telemetry-Pipeline
+
+  # ============================================================================
+  # 2. Ingestion Function CloudWatch Log Group & IAM Role
+  # ============================================================================
+  IngestionFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/iot-telemetry-ingest-${Environment}"
+      RetentionInDays: !Ref LogRetentionInDays
+
+  IngestionFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "iot-telemetry-ingest-role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CloudWatchLogsScopedAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt IngestionFunctionLogGroup.Arn
+
+        - PolicyName: DynamoDBTelemetryPutAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                Resource: !GetAtt TelemetryTable.Arn
+
+  # ============================================================================
+  # 3. Ingestion Lambda Function
+  # ============================================================================
+  IngestionFunction:
+    Type: AWS::Serverless::Function
+    DependsOn:
+      - IngestionFunctionLogGroup
+    Properties:
+      FunctionName: !Sub "iot-telemetry-ingest-${Environment}"
+      CodeUri: .
+      Handler: src.handlers.ingest_handler.lambda_handler
+      Runtime: python3.13
+      Architectures:
+        - x86_64
+      MemorySize: 128
+      Timeout: 15
+      Role: !GetAtt IngestionFunctionRole.Arn
+      Environment:
+        Variables:
+          TELEMETRY_TABLE_NAME: !Ref TelemetryTable
+          LOG_LEVEL: !Ref LogLevel
+          ENVIRONMENT: !Ref Environment
+      Tags:
+        Environment: !Ref Environment
+        Project: IoT-Telemetry-Pipeline
+
+  # ============================================================================
+  # 4. Dead-Letter Queue for IoT Topic Rule Failures (DLQ)
+  # ============================================================================
+  TelemetryDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "iot-telemetry-dlq-${Environment}"
+      MessageRetentionPeriod: 1209600 # 14 days
+      KmsMasterKeyId: alias/aws/sqs # AWS-managed KMS key ($0 cost)
+
+  IoTRuleErrorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "iot-telemetry-rule-dlq-role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: iot.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SqsSendMessageScoped
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt TelemetryDeadLetterQueue.Arn
+
+  # ============================================================================
+  # 5. Lambda Resource Policy (Allows IoT Core Invocation)
+  # ============================================================================
+  IoTRuleLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt IngestionFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: iot.amazonaws.com
+      SourceAccount: !Ref "AWS::AccountId"
+      SourceArn: !Sub "arn:${AWS::Partition}:iot:${AWS::Region}:${AWS::AccountId}:rule/${TelemetryIoTRule}"
+
+  # ============================================================================
+  # 6. AWS IoT Core Topic Rule (SQL routing from sensors/{device_id}/telemetry)
+  # ============================================================================
+  TelemetryIoTRule:
+    Type: AWS::IoT::TopicRule
+    Properties:
+      RuleName: !Sub "telemetry_ingest_rule_${Environment}"
+      TopicRulePayload:
+        RuleDisabled: false
+        AwsIotSqlVersion: "2016-03-23"
+        Sql: "SELECT *, topic(2) AS device_id FROM 'sensors/+/telemetry'"
+        Description: "Route sensor telemetry MQTT messages to Ingestion Lambda"
+        Actions:
+          - Lambda:
+              FunctionArn: !GetAtt IngestionFunction.Arn
+        ErrorAction:
+          Sqs:
+            QueueUrl: !Ref TelemetryDeadLetterQueue
+            RoleArn: !GetAtt IoTRuleErrorRole.Arn
+            UseBase64: false
+
+  # ============================================================================
+  # 7. Amazon API Gateway REST API (CORS enabled)
+  # ============================================================================
+  TelemetryApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub "iot-telemetry-api-${Environment}"
+      StageName: !Ref Environment
+      Cors:
+        AllowMethods: "'GET,OPTIONS'"
+        AllowHeaders: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+        AllowOrigin: "'*'"
+      GatewayResponses:
+        DEFAULT_4XX:
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: "'*'"
+        DEFAULT_5XX:
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: "'*'"
+
+  # ============================================================================
+  # 8. Query Function CloudWatch Log Group & IAM Role
+  # ============================================================================
+  QueryFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/iot-telemetry-query-${Environment}"
+      RetentionInDays: !Ref LogRetentionInDays
+
+  QueryFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "iot-telemetry-query-role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CloudWatchLogsScopedAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt QueryFunctionLogGroup.Arn
+
+        - PolicyName: DynamoDBTelemetryReadOnlyAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:Query
+                  - dynamodb:DescribeTable
+                Resource: !GetAtt TelemetryTable.Arn
+
+  # ============================================================================
+  # 9. Query Lambda Function (API Gateway Backend)
+  # ============================================================================
+  QueryFunction:
+    Type: AWS::Serverless::Function
+    DependsOn:
+      - QueryFunctionLogGroup
+    Properties:
+      FunctionName: !Sub "iot-telemetry-query-${Environment}"
+      CodeUri: .
+      Handler: src.handlers.api_handler.lambda_handler
+      Runtime: python3.13
+      Architectures:
+        - x86_64
+      MemorySize: 128
+      Timeout: 15
+      Role: !GetAtt QueryFunctionRole.Arn
+      Environment:
+        Variables:
+          TELEMETRY_TABLE_NAME: !Ref TelemetryTable
+          LOG_LEVEL: !Ref LogLevel
+          ENVIRONMENT: !Ref Environment
+      Events:
+        HealthCheck:
+          Type: Api
+          Properties:
+            RestApiId: !Ref TelemetryApi
+            Path: /health
+            Method: GET
+        GetLatest:
+          Type: Api
+          Properties:
+            RestApiId: !Ref TelemetryApi
+            Path: /devices/{device_id}/latest
+            Method: GET
+        GetHistory:
+          Type: Api
+          Properties:
+            RestApiId: !Ref TelemetryApi
+            Path: /devices/{device_id}/history
+            Method: GET
+      Tags:
+        Environment: !Ref Environment
+        Project: IoT-Telemetry-Pipeline
+
+  # ============================================================================
+  # 10. SNS Alert Topic & Subscription
+  # ============================================================================
+  TelemetryAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "iot-telemetry-alerts-${Environment}"
+      KmsMasterKeyId: alias/aws/sns
+
+  AlertEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref TelemetryAlertsTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # ============================================================================
+  # 11. CloudWatch Metric Filter: High-Temperature Detection
+  # Extracts temperature > 50.0 from structured Ingestion JSON logs
+  # ============================================================================
+  HighTemperatureMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref IngestionFunctionLogGroup
+      FilterPattern: "{ $.temperature > 50 }"
+      MetricTransformations:
+        - MetricNamespace: IoTTelemetry
+          MetricName: HighTemperatureCount
+          MetricValue: "1"
+          DefaultValue: 0
+
+  # ============================================================================
+  # 12. CloudWatch Alarms
+  # ============================================================================
+  HighTemperatureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "iot-high-temperature-alarm-${Environment}"
+      AlarmDescription: "Triggers when telemetry temperature exceeds 50.0 degrees Celsius"
+      MetricName: HighTemperatureCount
+      Namespace: IoTTelemetry
+      Statistic: Sum
+      Period: 60 # 1-minute evaluation
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref TelemetryAlertsTopic
+
+  IngestionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "iot-ingestion-errors-alarm-${Environment}"
+      AlarmDescription: "Triggers when Ingestion Lambda experiences errors"
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref IngestionFunction
+      Statistic: Sum
+      Period: 300 # 5-minute evaluation
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref TelemetryAlertsTopic
+
+  ApiGateway5xxErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "iot-api-5xx-errors-alarm-${Environment}"
+      AlarmDescription: "Triggers when API Gateway returns 5xx server errors"
+      MetricName: 5XXError
+      Namespace: AWS/ApiGateway
+      Dimensions:
+        - Name: ApiName
+          Value: !Sub "iot-telemetry-api-${Environment}"
+        - Name: Stage
+          Value: !Ref Environment
+      Statistic: Sum
+      Period: 300 # 5-minute evaluation
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref TelemetryAlertsTopic
+
+# ==============================================================================
+# Outputs
+# ==============================================================================
+Outputs:
+  TelemetryApiEndpoint:
+    Description: Base URL for IoT Telemetry REST API
+    Value: !Sub "https://${TelemetryApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}"
+    Export:
+      Name: !Sub "${AWS::StackName}-ApiEndpoint"
+
+  TelemetryTableName:
+    Description: Name of the DynamoDB telemetry table
+    Value: !Ref TelemetryTable
+    Export:
+      Name: !Sub "${AWS::StackName}-TelemetryTableName"
+
+  TelemetryTableArn:
+    Description: ARN of the DynamoDB telemetry table
+    Value: !GetAtt TelemetryTable.Arn
+
+  IngestionFunctionArn:
+    Description: ARN of the telemetry ingestion Lambda function
+    Value: !GetAtt IngestionFunction.Arn
+
+  QueryFunctionArn:
+    Description: ARN of the telemetry query Lambda function
+    Value: !GetAtt QueryFunction.Arn
+
+  TelemetryDeadLetterQueueUrl:
+    Description: URL of the SQS Dead Letter Queue for failed IoT Rule deliveries
+    Value: !Ref TelemetryDeadLetterQueue
+
+  TelemetryAlertsTopicArn:
+    Description: ARN of the SNS Topic for alarm notifications
+    Value: !Ref TelemetryAlertsTopic
